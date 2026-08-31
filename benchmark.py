@@ -1,0 +1,375 @@
+"""
+Script de automação de benchmark para o TSP Genetic Algorithm.
+
+Executa, para cada instância de teste e cada modo de execução (GA_ONLY, LS_ONLY,
+HYBRID), múltiplas rodadas com seeds aleatórias distintas. Salva o resultado de
+cada rodada individual em uma estrutura de pastas organizada e, ao final, compila
+todas as métricas estatísticas em um único arquivo `summary.json`.
+
+Estrutura de saída:
+    resultados/
+        <nome_instancia>/
+            <modo>/
+                tentativa_1_seed_<X>.json
+                ...
+        summary.json
+
+Uso:
+    python benchmark.py
+    python benchmark.py --instances data/att48.tsp data/eil51.tsp --runs 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import random
+import statistics
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from config import ApplicationConfig, GeneticAlgorithmConfig, ExecutionMode
+from data_loader import TSPDataLoader
+from engine import GeneticAlgorithmEngine
+from environment import TSPEnvironment
+from orchestrator import GeneticAlgorithmOrchestrator
+from solutions_reader import TSPLibSolutionsReader
+
+
+# Modos de execução a serem comparados no benchmark.
+EXECUTION_MODES: List[ExecutionMode] = [
+    ExecutionMode.GA_ONLY,
+    ExecutionMode.LS_ONLY,
+    ExecutionMode.HYBRID,
+]
+
+# Instâncias padrão (pequenas/médias) caso nenhuma seja informada via CLI.
+DEFAULT_INSTANCES: List[str] = [
+    "data/att48.tsp",
+    "data/eil51.tsp",
+    "data/berlin52.tsp",
+]
+
+DEFAULT_RUNS: int = 5
+RESULTS_ROOT: Path = Path("resultados")
+
+
+@dataclass
+class RunResult:
+    """Resultado de uma única rodada de execução."""
+
+    instance: str
+    mode: str
+    attempt: int
+    seed: int
+    best_distance: float
+    optimal_solution: Optional[int]
+    gap_from_optimal: Optional[float]
+    execution_time: float
+    generations_run: int
+    early_stopped: bool
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class BenchmarkConfig:
+    """Parâmetros de alto nível que controlam o benchmark."""
+
+    instances: List[str]
+    runs: int = DEFAULT_RUNS
+    results_root: Path = RESULTS_ROOT
+    population_size: int = 300
+    number_of_generations: int = 500
+    early_stopping_patience: int = 100
+    modes: List[ExecutionMode] = field(default_factory=lambda: list(EXECUTION_MODES))
+
+
+def build_ga_config(benchmark_config: BenchmarkConfig, mode: ExecutionMode, seed: int) -> GeneticAlgorithmConfig:
+    """Cria uma configuração de GA imutável para uma rodada específica.
+
+    A visualização ao vivo é desativada para não poluir a saída do benchmark e a
+    seed é fixada para garantir a reprodutibilidade de cada rodada.
+    """
+    base_config = ApplicationConfig().genetic_algorithm
+    return dataclasses.replace(
+        base_config,
+        population_size=benchmark_config.population_size,
+        number_of_generations=benchmark_config.number_of_generations,
+        early_stopping_patience=benchmark_config.early_stopping_patience,
+        random_seed=seed,
+        enable_live_visualization=False,
+        execution_mode=mode,
+    )
+
+
+def run_single(
+    instance_path: Path,
+    mode: ExecutionMode,
+    attempt: int,
+    seed: int,
+    benchmark_config: BenchmarkConfig,
+    solutions_reader: TSPLibSolutionsReader,
+) -> RunResult:
+    """Executa uma única rodada do algoritmo e captura suas métricas.
+
+    Qualquer exceção é capturada e registrada no próprio resultado para que uma
+    falha isolada não interrompa todo o benchmark.
+    """
+    optimal_solution = solutions_reader.get_optimal_solution(instance_path)
+
+    try:
+        # Fixa as seeds globais antes de qualquer operação estocástica.
+        random.seed(seed)
+
+        data_loader = TSPDataLoader(instance_path)
+        data_loader.load()
+
+        environment = TSPEnvironment(data_loader.get_distance_matrix())
+        engine = GeneticAlgorithmEngine(environment)
+
+        ga_config = build_ga_config(benchmark_config, mode, seed)
+        orchestrator = GeneticAlgorithmOrchestrator(
+            engine=engine,
+            config=ga_config,
+            number_of_cities=data_loader.get_number_of_cities(),
+        )
+
+        start_time = time.time()
+        _, best_distance = orchestrator.run_evolution()
+        execution_time = time.time() - start_time
+
+        gap = solutions_reader.calculate_gap(instance_path, best_distance)
+
+        return RunResult(
+            instance=instance_path.stem,
+            mode=mode.value,
+            attempt=attempt,
+            seed=seed,
+            best_distance=round(float(best_distance), 4),
+            optimal_solution=optimal_solution,
+            gap_from_optimal=round(gap, 4) if gap is not None else None,
+            execution_time=round(execution_time, 4),
+            generations_run=orchestrator.get_total_generations_run(),
+            early_stopped=orchestrator.was_early_stopped(),
+        )
+    except Exception as exception:  # noqa: BLE001 - queremos registrar qualquer falha.
+        return RunResult(
+            instance=instance_path.stem,
+            mode=mode.value,
+            attempt=attempt,
+            seed=seed,
+            best_distance=float("inf"),
+            optimal_solution=optimal_solution,
+            gap_from_optimal=None,
+            execution_time=0.0,
+            generations_run=0,
+            early_stopped=False,
+            error=f"{type(exception).__name__}: {exception}\n{traceback.format_exc()}",
+        )
+
+
+def save_run_result(result: RunResult, results_root: Path) -> Path:
+    """Persiste o resultado de uma rodada individual em JSON.
+
+    Caminho: resultados/<instancia>/<modo>/tentativa_<n>_seed_<seed>.json
+    """
+    output_dir = results_root / result.instance / result.mode
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / f"tentativa_{result.attempt}_seed_{result.seed}.json"
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(result.to_dict(), file, indent=4, ensure_ascii=False)
+
+    return output_path
+
+
+def compute_statistics(results: List[RunResult]) -> Dict:
+    """Calcula Best, Worst, Mean, Std e tempo médio a partir das rodadas válidas."""
+    valid_results = [r for r in results if r.error is None and r.best_distance != float("inf")]
+
+    if not valid_results:
+        return {
+            "successful_runs": 0,
+            "failed_runs": len(results),
+            "best": None,
+            "worst": None,
+            "mean": None,
+            "std_dev": None,
+            "mean_execution_time": None,
+        }
+
+    distances = [r.best_distance for r in valid_results]
+    times = [r.execution_time for r in valid_results]
+    optimal = valid_results[0].optimal_solution
+
+    best = min(distances)
+    mean = statistics.mean(distances)
+    # pstdev com uma única amostra é 0.0; stdev exige >= 2 amostras.
+    std_dev = statistics.stdev(distances) if len(distances) > 1 else 0.0
+
+    best_gap = None
+    if optimal:
+        best_gap = round(((best - optimal) / optimal) * 100, 4)
+
+    return {
+        "successful_runs": len(valid_results),
+        "failed_runs": len(results) - len(valid_results),
+        "optimal_solution": optimal,
+        "best": round(best, 4),
+        "worst": round(max(distances), 4),
+        "mean": round(mean, 4),
+        "std_dev": round(std_dev, 4),
+        "best_gap_percent": best_gap,
+        "mean_execution_time": round(statistics.mean(times), 4),
+    }
+
+
+def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
+    """Orquestra todo o benchmark: instâncias x modos x rodadas.
+
+    Retorna o objeto de sumário estruturado que será salvo em summary.json.
+    """
+    solutions_reader = TSPLibSolutionsReader()
+    summary: Dict[str, Dict] = {}
+
+    # Gera uma seed aleatória distinta por rodada.
+    seed_generator = random.Random()
+
+    for instance_str in benchmark_config.instances:
+        instance_path = Path(instance_str)
+
+        if not instance_path.exists():
+            print(f"  [AVISO] Instância não encontrada, pulando: {instance_path}")
+            continue
+
+        instance_name = instance_path.stem
+        summary[instance_name] = {}
+
+        print(f"\n{'=' * 80}")
+        print(f" INSTÂNCIA: {instance_name}")
+        print(f"{'=' * 80}")
+
+        for mode in benchmark_config.modes:
+            print(f"\n  Modo: {mode.value}")
+            mode_results: List[RunResult] = []
+
+            for attempt in range(1, benchmark_config.runs + 1):
+                seed = seed_generator.randint(1, 1_000_000)
+
+                result = run_single(
+                    instance_path=instance_path,
+                    mode=mode,
+                    attempt=attempt,
+                    seed=seed,
+                    benchmark_config=benchmark_config,
+                    solutions_reader=solutions_reader,
+                )
+                mode_results.append(result)
+                save_run_result(result, benchmark_config.results_root)
+
+                if result.error is None:
+                    print(
+                        f"    Tentativa {attempt}/{benchmark_config.runs} "
+                        f"(seed={seed}): dist={result.best_distance:.2f} "
+                        f"gap={result.gap_from_optimal}% tempo={result.execution_time:.2f}s"
+                    )
+                else:
+                    print(f"    Tentativa {attempt}/{benchmark_config.runs} (seed={seed}): FALHOU")
+
+            stats = compute_statistics(mode_results)
+            summary[instance_name][mode.value] = {
+                "algorithm": mode.value,
+                "instance": instance_name,
+                **stats,
+            }
+
+    return summary
+
+
+def save_summary(summary: Dict, results_root: Path) -> Path:
+    """Salva o objeto de sumário completo em resultados/summary.json."""
+    results_root.mkdir(parents=True, exist_ok=True)
+    summary_path = results_root / "summary.json"
+    with open(summary_path, "w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=4, ensure_ascii=False)
+    return summary_path
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Benchmark do TSP Genetic Algorithm.")
+    parser.add_argument(
+        "--instances",
+        nargs="+",
+        default=DEFAULT_INSTANCES,
+        help="Lista de arquivos .tsp a serem testados.",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=DEFAULT_RUNS,
+        help="Número de rodadas por (instância, modo).",
+    )
+    parser.add_argument(
+        "--population",
+        type=int,
+        default=300,
+        help="Tamanho da população do GA.",
+    )
+    parser.add_argument(
+        "--generations",
+        type=int,
+        default=500,
+        help="Número máximo de gerações (ou restarts no modo LS_ONLY).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=100,
+        help="Paciência para parada antecipada.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    arguments = parse_arguments()
+
+    benchmark_config = BenchmarkConfig(
+        instances=arguments.instances,
+        runs=arguments.runs,
+        population_size=arguments.population,
+        number_of_generations=arguments.generations,
+        early_stopping_patience=arguments.patience,
+    )
+
+    print("\n" + "=" * 80)
+    print(" TSP BENCHMARK RUNNER")
+    print("=" * 80)
+    print(f" Instâncias: {benchmark_config.instances}")
+    print(f" Modos:      {[m.value for m in benchmark_config.modes]}")
+    print(f" Rodadas:    {benchmark_config.runs} por (instância, modo)")
+    print(f" Total de execuções: "
+          f"{len(benchmark_config.instances) * len(benchmark_config.modes) * benchmark_config.runs}")
+
+    start_time = time.time()
+    summary = run_benchmark(benchmark_config)
+    total_time = time.time() - start_time
+
+    summary_path = save_summary(summary, benchmark_config.results_root)
+
+    print("\n" + "=" * 80)
+    print(" BENCHMARK CONCLUÍDO")
+    print("=" * 80)
+    print(f" Tempo total: {total_time:.2f}s")
+    print(f" Sumário salvo em: {summary_path.absolute()}")
+    print(f" Resultados individuais em: {benchmark_config.results_root.absolute()}")
+
+
+if __name__ == "__main__":
+    main()

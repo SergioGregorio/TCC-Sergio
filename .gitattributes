@@ -1,0 +1,6 @@
+# Normaliza quebras de linha: LF no repositório
+* text=auto eol=lf
+
+# Arquivos de dados TSPLIB são texto
+*.tsp text
+*.problems text
