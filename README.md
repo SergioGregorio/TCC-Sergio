@@ -64,7 +64,14 @@ python benchmark.py
 
 # Personalizado
 python benchmark.py --instances data/att48.tsp data/a280.tsp --runs 5 --generations 500 --population 300 --patience 100
+
+# Com limite de tempo por rodada (evita execuções muito longas em instâncias grandes)
+python benchmark.py --instances data/fnl4461.tsp --runs 5 --timeout 120
 ```
+
+Opções do CLI: `--instances`, `--runs`, `--population`, `--generations`, `--patience`, `--timeout`.
+
+Quando `--timeout <segundos>` é usado (> 0), cada rodada é executada em um **processo separado e serial** e é **terminada** se exceder o limite. Rodadas interrompidas são registradas com `timed_out: true` e contabilizadas em `timeout_runs` no `summary.json`.
 
 Estrutura de saída:
 
