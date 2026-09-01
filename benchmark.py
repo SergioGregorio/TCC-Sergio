@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import multiprocessing as mp
 import random
 import statistics
 import time
@@ -73,9 +74,13 @@ class RunResult:
     generations_run: int
     early_stopped: bool
     error: Optional[str] = None
+    timed_out: bool = False
 
     def to_dict(self) -> Dict:
-        return dataclasses.asdict(self)
+        data = dataclasses.asdict(self)
+        if data["best_distance"] == float("inf"):
+            data["best_distance"] = None
+        return data
 
 
 @dataclass
@@ -88,16 +93,25 @@ class BenchmarkConfig:
     population_size: int = 300
     number_of_generations: int = 500
     early_stopping_patience: int = 100
+    timeout_seconds: int = 0
     modes: List[ExecutionMode] = field(default_factory=lambda: list(EXECUTION_MODES))
 
 
-def build_ga_config(benchmark_config: BenchmarkConfig, mode: ExecutionMode, seed: int) -> GeneticAlgorithmConfig:
+def build_ga_config(
+    benchmark_config: BenchmarkConfig,
+    mode: ExecutionMode,
+    seed: int,
+    force_serial: bool = False,
+) -> GeneticAlgorithmConfig:
     """Cria uma configuração de GA imutável para uma rodada específica.
 
     A visualização ao vivo é desativada para não poluir a saída do benchmark e a
-    seed é fixada para garantir a reprodutibilidade de cada rodada.
+    seed é fixada para garantir a reprodutibilidade de cada rodada. Quando
+    ``force_serial`` é True (execução sob timeout), o número de processos é
+    forçado para 1, evitando workers órfãos caso o processo seja terminado.
     """
     base_config = ApplicationConfig().genetic_algorithm
+    processes = 1 if force_serial else base_config.number_of_processes
     return dataclasses.replace(
         base_config,
         population_size=benchmark_config.population_size,
@@ -105,6 +119,7 @@ def build_ga_config(benchmark_config: BenchmarkConfig, mode: ExecutionMode, seed
         early_stopping_patience=benchmark_config.early_stopping_patience,
         random_seed=seed,
         enable_live_visualization=False,
+        number_of_processes=processes,
         execution_mode=mode,
     )
 
@@ -116,6 +131,7 @@ def run_single(
     seed: int,
     benchmark_config: BenchmarkConfig,
     solutions_reader: TSPLibSolutionsReader,
+    force_serial: bool = False,
 ) -> RunResult:
     """Executa uma única rodada do algoritmo e captura suas métricas.
 
@@ -134,7 +150,7 @@ def run_single(
         environment = TSPEnvironment(data_loader.get_distance_matrix())
         engine = GeneticAlgorithmEngine(environment)
 
-        ga_config = build_ga_config(benchmark_config, mode, seed)
+        ga_config = build_ga_config(benchmark_config, mode, seed, force_serial=force_serial)
         orchestrator = GeneticAlgorithmOrchestrator(
             engine=engine,
             config=ga_config,
@@ -175,6 +191,97 @@ def run_single(
         )
 
 
+def _timeout_worker(
+    instance_path_str: str,
+    mode_value: str,
+    attempt: int,
+    seed: int,
+    benchmark_config: BenchmarkConfig,
+    queue: "mp.Queue",
+) -> None:
+    """Executado em um processo separado; roda uma rodada e envia o resultado pela fila.
+
+    Definido no n\u00edvel do m\u00f3dulo para ser pickl\u00e1vel (necess\u00e1rio no Windows com spawn).
+    """
+    reader = TSPLibSolutionsReader()
+    result = run_single(
+        instance_path=Path(instance_path_str),
+        mode=ExecutionMode(mode_value),
+        attempt=attempt,
+        seed=seed,
+        benchmark_config=benchmark_config,
+        solutions_reader=reader,
+        force_serial=True,
+    )
+    queue.put(result)
+
+
+def run_with_timeout(
+    instance_path: Path,
+    mode: ExecutionMode,
+    attempt: int,
+    seed: int,
+    benchmark_config: BenchmarkConfig,
+    solutions_reader: TSPLibSolutionsReader,
+) -> RunResult:
+    """Executa uma rodada respeitando ``benchmark_config.timeout_seconds``.
+
+    Se o timeout for 0 (ou negativo), executa normalmente no processo atual. Caso
+    contr\u00e1rio, roda a rodada em um processo separado e o termina caso exceda o
+    limite, retornando um ``RunResult`` marcado com ``timed_out=True``.
+    """
+    timeout = benchmark_config.timeout_seconds
+    if not timeout or timeout <= 0:
+        return run_single(instance_path, mode, attempt, seed, benchmark_config, solutions_reader)
+
+    optimal_solution = solutions_reader.get_optimal_solution(instance_path)
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    process = context.Process(
+        target=_timeout_worker,
+        args=(str(instance_path), mode.value, attempt, seed, benchmark_config, queue),
+    )
+    
+    start_time = time.time()
+    process.start()
+    process.join(timeout)
+    
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        return RunResult(
+            instance=instance_path.stem,
+            mode=mode.value,
+            attempt=attempt,
+            seed=seed,
+            best_distance=float("inf"),
+            optimal_solution=optimal_solution,
+            gap_from_optimal=None,
+            execution_time=round(time.time() - start_time, 4),
+            generations_run=0,
+            early_stopped=False,
+            error=f"TIMEOUT after {timeout}s",
+            timed_out=True,
+        )
+    
+    try:
+        return queue.get(timeout=10)
+    except Exception:
+        return RunResult(
+            instance=instance_path.stem,
+            mode=mode.value,
+            attempt=attempt,
+            seed=seed,
+            best_distance=float("inf"),
+            optimal_solution=optimal_solution,
+            gap_from_optimal=None,
+            execution_time=round(time.time() - start_time, 4),
+            generations_run=0,
+            early_stopped=False,
+            error="No result returned by worker process",
+        )
+
+
 def save_run_result(result: RunResult, results_root: Path) -> Path:
     """Persiste o resultado de uma rodada individual em JSON.
 
@@ -194,10 +301,13 @@ def compute_statistics(results: List[RunResult]) -> Dict:
     """Calcula Best, Worst, Mean, Std e tempo médio a partir das rodadas válidas."""
     valid_results = [r for r in results if r.error is None and r.best_distance != float("inf")]
 
+    timeout_runs = sum(1 for r in results if r.timed_out)
+
     if not valid_results:
         return {
             "successful_runs": 0,
             "failed_runs": len(results),
+            "timeout_runs": timeout_runs,
             "best": None,
             "worst": None,
             "mean": None,
@@ -221,6 +331,7 @@ def compute_statistics(results: List[RunResult]) -> Dict:
     return {
         "successful_runs": len(valid_results),
         "failed_runs": len(results) - len(valid_results),
+        "timeout_runs": timeout_runs,
         "optimal_solution": optimal,
         "best": round(best, 4),
         "worst": round(max(distances), 4),
@@ -263,7 +374,7 @@ def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
             for attempt in range(1, benchmark_config.runs + 1):
                 seed = seed_generator.randint(1, 1_000_000)
 
-                result = run_single(
+                result = run_with_timeout(
                     instance_path=instance_path,
                     mode=mode,
                     attempt=attempt,
@@ -274,7 +385,12 @@ def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
                 mode_results.append(result)
                 save_run_result(result, benchmark_config.results_root)
 
-                if result.error is None:
+                if result.timed_out:
+                    print(
+                        f"    Tentativa {attempt}/{benchmark_config.runs} "
+                        f"(seed={seed}): TIMEOUT (> {benchmark_config.timeout_seconds}s)"
+                    )
+                elif result.error is None:
                     print(
                         f"    Tentativa {attempt}/{benchmark_config.runs} "
                         f"(seed={seed}): dist={result.best_distance:.2f} "
@@ -334,6 +450,15 @@ def parse_arguments() -> argparse.Namespace:
         default=100,
         help="Paciência para parada antecipada.",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help=(
+            "Tempo máximo por rodada em segundos (0 = sem limite). Ao ativar, cada "
+            "rodada roda em um processo separado e serial, sendo terminada se exceder o limite."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -346,6 +471,7 @@ def main() -> None:
         population_size=arguments.population,
         number_of_generations=arguments.generations,
         early_stopping_patience=arguments.patience,
+        timeout_seconds=arguments.timeout,
     )
 
     print("\n" + "=" * 80)
@@ -354,6 +480,8 @@ def main() -> None:
     print(f" Instâncias: {benchmark_config.instances}")
     print(f" Modos:      {[m.value for m in benchmark_config.modes]}")
     print(f" Rodadas:    {benchmark_config.runs} por (instância, modo)")
+    timeout_label = f"{benchmark_config.timeout_seconds}s" if benchmark_config.timeout_seconds > 0 else "sem limite"
+    print(f" Timeout:    {timeout_label} por rodada")
     print(f" Total de execuções: "
           f"{len(benchmark_config.instances) * len(benchmark_config.modes) * benchmark_config.runs}")
 
