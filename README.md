@@ -69,7 +69,9 @@ python benchmark.py --instances data/att48.tsp data/a280.tsp --runs 5 --generati
 python benchmark.py --instances data/fnl4461.tsp --runs 5 --timeout 120
 ```
 
-Opções do CLI: `--instances`, `--runs`, `--population`, `--generations`, `--patience`, `--timeout`.
+Opções do CLI: `--instances`, `--runs`, `--population`, `--generations`, `--patience`, `--timeout`, `--no-plots`.
+
+Durante a execução, o benchmark exibe um **medidor de progresso** por rodada (contagem, porcentagem, tempo decorrido e ETA). Ao final, gera **gráficos comparativos** (use `--no-plots` para desativar).
 
 Quando `--timeout <segundos>` é usado (> 0), cada rodada é executada em um **processo separado e serial** e é **terminada** se exceder o limite. Rodadas interrompidas são registradas com `timed_out: true` e contabilizadas em `timeout_runs` no `summary.json`.
 
@@ -81,10 +83,17 @@ resultados/
         <modo>/
             tentativa_1_seed_<X>.json
             ...
+        comparison.png          # grafico comparativo da instancia
     summary.json
+    summary_comparison.png      # comparacao entre instancias (se houver > 1)
 ```
 
-O `summary.json` traz, por instância e modo: melhor (`best`), pior (`worst`), média (`mean`), desvio padrão (`std_dev`), gap do ótimo e tempo médio de execução.
+O `summary.json` traz, por instância e modo: melhor (`best`), pior (`worst`), média (`mean`), desvio padrão (`std_dev`), gap do ótimo, tempo médio de execução e número de timeouts (`timeout_runs`).
+
+Gráficos gerados:
+
+- **`<instancia>/comparison.png`**: 4 painéis por instância — distância (best/mean +/- std), distribuição das distâncias (boxplot), gap do ótimo (%) e tempo médio de execução, comparando os três modos.
+- **`summary_comparison.png`**: barras agrupadas do gap best (%) por modo em todas as instâncias (apenas quando há mais de uma instância).
 
 ## Estrutura do projeto
 
@@ -92,12 +101,14 @@ O `summary.json` traz, por instância e modo: melhor (`best`), pior (`worst`), m
 tsp-genetic-algorithm/
 ├── main.py               # Ponto de entrada (execução única)
 ├── benchmark.py          # Runner de experimentos
+├── benchmark_visualizer.py # Gráficos comparativos do benchmark
 ├── config.py             # Configurações (dataclasses)
 ├── data_loader.py        # Parser TSPLIB + matriz de distâncias vetorizada
 ├── environment.py        # Avaliação de rotas
 ├── engine.py             # Função de fitness (DEAP)
 ├── orchestrator.py       # Loop evolutivo + modos de execução
 ├── local_search.py       # 2-opt (KNN + don't-look bits)
+├── progress.py           # Barra de progresso de terminal (ETA)
 ├── solutions_reader.py   # Ótimos conhecidos + cálculo de gap
 ├── visualizer.py         # Geração das visualizações
 ├── data/                 # Instâncias TSPLIB (.tsp) + arquivo de soluções

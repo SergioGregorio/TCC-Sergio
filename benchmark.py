@@ -31,7 +31,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from config import ApplicationConfig, GeneticAlgorithmConfig, ExecutionMode
 from data_loader import TSPDataLoader
@@ -39,6 +39,8 @@ from engine import GeneticAlgorithmEngine
 from environment import TSPEnvironment
 from orchestrator import GeneticAlgorithmOrchestrator
 from solutions_reader import TSPLibSolutionsReader
+from progress import format_duration
+from benchmark_visualizer import generate_benchmark_reports
 
 
 # Modos de execução a serem comparados no benchmark.
@@ -342,26 +344,37 @@ def compute_statistics(results: List[RunResult]) -> Dict:
     }
 
 
-def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
+def run_benchmark(benchmark_config: BenchmarkConfig) -> Tuple[Dict, Dict[str, Dict[str, List[RunResult]]]]:
     """Orquestra todo o benchmark: instâncias x modos x rodadas.
 
-    Retorna o objeto de sumário estruturado que será salvo em summary.json.
+    Retorna uma tupla ``(summary, detailed)``:
+    - ``summary``: objeto estruturado salvo em summary.json.
+    - ``detailed``: mapeia instância -> modo -> lista de ``RunResult`` (para gráficos).
     """
     solutions_reader = TSPLibSolutionsReader()
     summary: Dict[str, Dict] = {}
+    detailed: Dict[str, Dict[str, List[RunResult]]] = {}
 
     # Gera uma seed aleatória distinta por rodada.
     seed_generator = random.Random()
+
+    total_runs = (
+        len(benchmark_config.instances) * len(benchmark_config.modes) * benchmark_config.runs
+    )
+    completed_runs = 0
+    benchmark_start = time.time()
 
     for instance_str in benchmark_config.instances:
         instance_path = Path(instance_str)
 
         if not instance_path.exists():
             print(f"  [AVISO] Instância não encontrada, pulando: {instance_path}")
+            completed_runs += len(benchmark_config.modes) * benchmark_config.runs
             continue
 
         instance_name = instance_path.stem
         summary[instance_name] = {}
+        detailed[instance_name] = {}
 
         print(f"\n{'=' * 80}")
         print(f" INSTÂNCIA: {instance_name}")
@@ -385,20 +398,34 @@ def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
                 mode_results.append(result)
                 save_run_result(result, benchmark_config.results_root)
 
+                completed_runs += 1
+                elapsed = time.time() - benchmark_start
+                rate = completed_runs / elapsed if elapsed > 0 else 0.0
+                eta = (total_runs - completed_runs) / rate if rate > 0 else 0.0
+                fraction = completed_runs / total_runs * 100 if total_runs else 100.0
+                progress = (
+                    f" | [{completed_runs}/{total_runs} {fraction:.1f}% "
+                    f"elapsed {format_duration(elapsed)} ETA {format_duration(eta)}]"
+                )
+
                 if result.timed_out:
                     print(
                         f"    Tentativa {attempt}/{benchmark_config.runs} "
-                        f"(seed={seed}): TIMEOUT (> {benchmark_config.timeout_seconds}s)"
+                        f"(seed={seed}): TIMEOUT (> {benchmark_config.timeout_seconds}s){progress}"
                     )
                 elif result.error is None:
                     print(
                         f"    Tentativa {attempt}/{benchmark_config.runs} "
                         f"(seed={seed}): dist={result.best_distance:.2f} "
-                        f"gap={result.gap_from_optimal}% tempo={result.execution_time:.2f}s"
+                        f"gap={result.gap_from_optimal}% tempo={result.execution_time:.2f}s{progress}"
                     )
                 else:
-                    print(f"    Tentativa {attempt}/{benchmark_config.runs} (seed={seed}): FALHOU")
+                    print(
+                        f"    Tentativa {attempt}/{benchmark_config.runs} "
+                        f"(seed={seed}): FALHOU{progress}"
+                    )
 
+            detailed[instance_name][mode.value] = mode_results
             stats = compute_statistics(mode_results)
             summary[instance_name][mode.value] = {
                 "algorithm": mode.value,
@@ -406,7 +433,7 @@ def run_benchmark(benchmark_config: BenchmarkConfig) -> Dict:
                 **stats,
             }
 
-    return summary
+    return summary, detailed
 
 
 def save_summary(summary: Dict, results_root: Path) -> Path:
@@ -459,6 +486,11 @@ def parse_arguments() -> argparse.Namespace:
             "rodada roda em um processo separado e serial, sendo terminada se exceder o limite."
         ),
     )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Desativa a geração dos gráficos comparativos ao final do benchmark.",
+    )
     return parser.parse_args()
 
 
@@ -486,7 +518,7 @@ def main() -> None:
           f"{len(benchmark_config.instances) * len(benchmark_config.modes) * benchmark_config.runs}")
 
     start_time = time.time()
-    summary = run_benchmark(benchmark_config)
+    summary, detailed = run_benchmark(benchmark_config)
     total_time = time.time() - start_time
 
     summary_path = save_summary(summary, benchmark_config.results_root)
@@ -494,9 +526,18 @@ def main() -> None:
     print("\n" + "=" * 80)
     print(" BENCHMARK CONCLUÍDO")
     print("=" * 80)
-    print(f" Tempo total: {total_time:.2f}s")
+    print(f" Tempo total: {format_duration(total_time)} ({total_time:.2f}s)")
     print(f" Sumário salvo em: {summary_path.absolute()}")
     print(f" Resultados individuais em: {benchmark_config.results_root.absolute()}")
+
+    if not arguments.no_plots:
+        print("\n Gerando gráficos comparativos...")
+        try:
+            generated = generate_benchmark_reports(summary, detailed, benchmark_config.results_root)
+            for path in generated:
+                print(f"   - {path.absolute()}")
+        except Exception as exception:
+            print(f"   [AVISO] Falha ao gerar gráficos: {exception}")
 
 
 if __name__ == "__main__":
