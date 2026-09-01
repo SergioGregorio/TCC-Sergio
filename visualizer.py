@@ -64,17 +64,49 @@ class TSPVisualizer:
         self.plot_enhanced_solution(best_route, best_distance, output_path)
     
     def plot_fitness_evolution(self, fitness_history: List[float], output_path: Path) -> None:
-        plt.figure(figsize=(10, 6))
-        plt.plot(fitness_history, color="blue")
-        plt.xlabel("Generation")
-        plt.ylabel("Best Fitness (Distance)")
-        plt.title("Fitness Evolution Over Generations", fontweight="bold")
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
+        if not fitness_history:
+            return
+        
+        generations = list(range(len(fitness_history)))
+        initial_value = fitness_history[0]
+        final_value = fitness_history[-1]
+        best_index = int(np.argmin(fitness_history))
+        best_value = fitness_history[best_index]
+        improvement_percent = (
+            (initial_value - final_value) / initial_value * 100 if initial_value else 0.0
+        )
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(generations, fitness_history, color="#1f77b4", linewidth=2, label="Best distance")
+        ax.fill_between(generations, fitness_history, final_value, color="#1f77b4", alpha=0.08)
+        
+        ax.scatter([0], [initial_value], color="#d62728", zorder=5, label=f"Initial: {initial_value:.2f}")
+        ax.scatter([best_index], [best_value], color="#2ca02c", zorder=5, label=f"Best: {best_value:.2f}")
+        ax.annotate(
+            f"Best @ gen {best_index}\n{best_value:.2f}",
+            (best_index, best_value),
+            textcoords="offset points",
+            xytext=(10, 20),
+            fontsize=9,
+            fontweight="bold",
+            color="#2ca02c",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#2ca02c"),
+            arrowprops=dict(arrowstyle="->", color="#2ca02c")
+        )
+        
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Best Fitness (Distance)")
+        ax.set_title(
+            f"Convergence Curve  |  Improvement: {improvement_percent:.2f}%",
+            fontweight="bold"
+        )
+        ax.grid(alpha=0.3, linestyle="--")
+        ax.legend(loc="upper right")
+        fig.tight_layout()
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output_path, dpi=self.config.dpi)
-        plt.close()
+        fig.savefig(output_path, dpi=self.config.dpi)
+        plt.close(fig)
     
     def plot_enhanced_solution(self, best_route: List[int], best_distance: float, output_path: Path) -> None:
         fig, ax = plt.subplots(figsize=(self.config.figure_width, self.config.figure_height))
@@ -290,22 +322,6 @@ class TSPVisualizer:
         ]
         
         return "\n".join(lines)
-    
-    def print_progress_bar(
-        self,
-        generation: int,
-        total_generations: int,
-        best_fitness: float,
-        bar_length: int = 50
-    ) -> None:
-        progress = generation / total_generations
-        filled_length = int(bar_length * progress)
-        bar = "#" * filled_length + "-" * (bar_length - filled_length)
-        print(
-            "\r| Gen " + f"{generation:>4}" + "/" + f"{total_generations}" + " | " + bar +
-            " | " + f"{progress * 100:>6.2f}" + "% | Best: " + f"{best_fitness:>10.2f}" + " |",
-            end=""
-        )
     
     def plot_top_5_comparison(
         self,
