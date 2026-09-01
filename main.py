@@ -9,6 +9,7 @@ from engine import GeneticAlgorithmEngine
 from orchestrator import GeneticAlgorithmOrchestrator
 from visualizer import TSPVisualizer
 from solutions_reader import TSPLibSolutionsReader
+from progress import ProgressReporter
 
 
 BANNER_WIDTH = 80
@@ -99,10 +100,18 @@ def main() -> None:
     
     print_section("STARTING GENETIC ALGORITHM EVOLUTION")
     
+    progress_label = "Restarts" if config.genetic_algorithm.execution_mode.value == "LS_ONLY" else "Evolution"
+    reporter = ProgressReporter(
+        total=config.genetic_algorithm.number_of_generations,
+        label=progress_label,
+        value_label="Best"
+    )
+    
     def progress_callback(generation: int, total: int, fitness: float, route: List[int]) -> None:
-        visualizer.print_progress_bar(generation, total, fitness)
+        reporter.update(generation, fitness)
     
     start_time = time.time()
+    reporter.start()
     
     if config.genetic_algorithm.enable_live_visualization:
         best_route, best_distance = orchestrator.run_evolution(progress_callback=progress_callback)
@@ -111,6 +120,10 @@ def main() -> None:
     
     end_time = time.time()
     execution_time = end_time - start_time
+    
+    if config.genetic_algorithm.enable_live_visualization:
+        reporter.total = max(1, orchestrator.get_total_generations_run())
+        reporter.finish(best_distance)
     
     print()
     print_section("EVOLUTION COMPLETED SUCCESSFULLY")
